@@ -5,7 +5,7 @@ import {
   Upload, Link as LinkIcon, Sun, Contrast, ZoomIn, Move, Ruler,
   RotateCw, FlipHorizontal, RefreshCw, Play, Pause, Share2,
   FolderDown, Trash2, CheckCircle2, Wifi, WifiOff, Plus, X,
-  FileText, Sliders, ChevronLeft, ChevronRight, Download, ShieldCheck, ExternalLink
+  FileText, Sliders, ChevronLeft, ChevronRight, Download, ShieldCheck, Globe
 } from 'lucide-react';
 
 // ==========================================
@@ -74,7 +74,6 @@ function base64ToArrayBuffer(base64) {
 
 async function nativeFetchArrayBuffer(url) {
   try {
-    // Usar CapacitorHttp nativo en Android para evitar bloqueos CORS
     const res = await CapacitorHttp.get({
       url,
       responseType: 'arraybuffer',
@@ -86,16 +85,14 @@ async function nativeFetchArrayBuffer(url) {
       throw new Error(`HTTP ${res.status}`);
     }
     if (typeof res.data === 'string') {
-      // Puede venir en base64 si es binario o como texto HTML si es portal web
       const trimmed = res.data.trim();
-      if (trimmed.startsWith('<!DOCTYPE') || trimmed.startsWith('<html') || trimmed.startsWith('{')) {
+      if (trimmed.startsWith('<!DOCTYPE') || trimmed.startsWith('<html') || trimmed.startsWith('{') || trimmed.startsWith('<')) {
         return { isText: true, text: res.data };
       }
       return { isText: false, buffer: base64ToArrayBuffer(res.data) };
     }
     return { isText: false, buffer: res.data };
   } catch (nativeErr) {
-    // Fallback a fetch estándar en navegador web
     const response = await fetch(url);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const contentType = response.headers.get('content-type') || '';
@@ -113,7 +110,6 @@ async function extractBuffersFromZip(zipBuffer) {
 
   for (const entry of entries) {
     const lower = entry.name.toLowerCase();
-    // Ignorar archivos de sistema o imágenes web comunes; procesar .dcm o archivos sin extensión DICOMDIR/series
     if (lower.endsWith('.txt') || lower.endsWith('.xml') || lower.endsWith('.json') || lower.endsWith('.html') || lower.endsWith('.exe')) {
       continue;
     }
@@ -122,9 +118,7 @@ async function extractBuffersFromZip(zipBuffer) {
       try {
         parseDicomArrayBuffer(buf);
         dcmBuffers.push(buf);
-      } catch (_) {
-        // No es un archivo DICOM válido, omitir
-      }
+      } catch (_) {}
     }
   }
   if (dcmBuffers.length === 0) {
@@ -276,7 +270,7 @@ function parseDicomArrayBuffer(buffer) {
   }
 
   if (pixelDataOffset === null) {
-    throw new Error('No se encontró PixelData válido en el archivo DICOM.');
+    throw new Error('La liga abrió un portal web, no un archivo .dcm directo.');
   }
 
   const totalPixels = rows * cols;
@@ -446,7 +440,7 @@ export default function DicomViewerApp() {
   const [showBatchModal, setShowBatchModal] = useState(false);
   const [showOfflineModal, setShowOfflineModal] = useState(false);
   const [showShareModal, setShowShareModal] = useState(false);
-  const [portalHelperUrl, setPortalHelperUrl] = useState(null);
+  const [inAppPortalUrl, setInAppPortalUrl] = useState(null);
   const [savedStudies, setSavedStudies] = useState([]);
   const [isOnline, setIsOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
   const [statusMessage, setStatusMessage] = useState(null);
@@ -636,7 +630,6 @@ export default function DicomViewerApp() {
     if (cleanUrls.length === 0) return;
 
     try {
-      setPortalHelperUrl(null);
       setDownloadProgress({ current: 0, total: cleanUrls.length });
       let fetchedBuffers = [];
 
@@ -645,7 +638,6 @@ export default function DicomViewerApp() {
         const result = await nativeFetchArrayBuffer(cleanUrls[i]);
 
         if (result.isText) {
-          // Intentar extraer enlaces .dcm dentro del HTML/JSON del portal web
           const matches = result.text.match(/https?:\/\/[^\s"'<>]+?\.dcm(?:\?[^\s"'<>]*)?/gi);
           if (matches && matches.length > 0) {
             const uniqueDcms = [...new Set(matches)];
@@ -654,23 +646,34 @@ export default function DicomViewerApp() {
               if (!dcmRes.isText && dcmRes.buffer) fetchedBuffers.push(dcmRes.buffer);
             }
           } else {
-            setPortalHelperUrl(cleanUrls[i]);
-            throw new Error('Esta liga abre un portal web interactivo (no un archivo .dcm directo).');
+            // Abrir el portal dentro de la misma APK
+            setInAppPortalUrl(cleanUrls[i]);
+            setDownloadProgress(null);
+            return;
           }
         } else if (result.buffer) {
-          // Verificar si es un archivo ZIP (firma PK 0x50 0x4B)
           const header = new Uint8Array(result.buffer.slice(0, 4));
           if (header[0] === 0x50 && header[1] === 0x4B) {
             const zipDcms = await extractBuffersFromZip(result.buffer);
             fetchedBuffers.push(...zipDcms);
           } else {
-            fetchedBuffers.push(result.buffer);
+            try {
+              parseDicomArrayBuffer(result.buffer);
+              fetchedBuffers.push(result.buffer);
+            } catch (_) {
+              // Si lo descargado fue HTML codificado como buffer, abrir en el portal interno de la app
+              setInAppPortalUrl(cleanUrls[i]);
+              setDownloadProgress(null);
+              return;
+            }
           }
         }
       }
 
       if (fetchedBuffers.length === 0) {
-        throw new Error('No se obtuvieron cortes DICOM válidos.');
+        setInAppPortalUrl(cleanUrls[0]);
+        setDownloadProgress(null);
+        return;
       }
 
       processBuffers(fetchedBuffers, `Estudio cargado (${fetchedBuffers.length} corte(s))`);
@@ -696,10 +699,8 @@ export default function DicomViewerApp() {
         });
       }
     } catch (err) {
-      setStatusMessage({
-        type: 'error',
-        text: err.message,
-      });
+      // Ante cualquier liga de portal web, abrirla dentro del visor integrado de la APK
+      setInAppPortalUrl(cleanUrls[0]);
     } finally {
       setDownloadProgress(null);
     }
@@ -771,7 +772,8 @@ export default function DicomViewerApp() {
         }
       }
 
-      processBuffers(allBuffers, `${allBuffers.length} corte(s) DICOM listos. Toca "Guardar Offline" para conservarlos.`);
+      setInAppPortalUrl(null);
+      processBuffers(allBuffers, `${allBuffers.length} corte(s) DICOM cargados. Toca "Guardar Offline" para conservarlos.`);
     } catch (err) {
       setStatusMessage({ type: 'error', text: err.message || 'Archivo no válido.' });
     } finally {
@@ -924,7 +926,7 @@ export default function DicomViewerApp() {
           </div>
         </div>
 
-        {/* Barra para pegar liga DICOM o ZIP */}
+        {/* Barra para pegar liga DICOM, ZIP o Portal */}
         <div className="flex items-center flex-1 max-w-xl gap-1.5">
           <div className="relative flex-1">
             <LinkIcon className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
@@ -942,7 +944,7 @@ export default function DicomViewerApp() {
             className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium bg-sky-600 hover:bg-sky-500 disabled:opacity-40 rounded-lg text-white transition"
           >
             <Download className="w-3.5 h-3.5" />
-            <span>Descargar</span>
+            <span>Abrir / Bajar</span>
           </button>
           <button
             onClick={() => setShowBatchModal(true)}
@@ -953,7 +955,7 @@ export default function DicomViewerApp() {
           </button>
         </div>
 
-        {/* Botones de Biblioteca Offline y Archivo Local (.dcm o .zip) */}
+        {/* Botones de Biblioteca Offline y Archivo Local */}
         <div className="flex items-center gap-1.5">
           <button
             onClick={() => setShowOfflineModal(true)}
@@ -994,32 +996,19 @@ export default function DicomViewerApp() {
         </div>
       )}
 
-      {/* MENSAJE DE ESTADO O AYUDA PARA PORTAL WEB */}
+      {/* MENSAJE DE ESTADO */}
       {statusMessage && (
         <div
-          className={`px-4 py-2 text-xs flex flex-wrap items-center justify-between gap-2 border-b ${
+          className={`px-4 py-1.5 text-xs flex items-center justify-between border-b ${
             statusMessage.type === 'error'
               ? 'bg-rose-950/90 border-rose-800 text-rose-200'
               : 'bg-emerald-950/90 border-emerald-800 text-emerald-200'
           }`}
         >
           <span>{statusMessage.text}</span>
-          <div className="flex items-center gap-2">
-            {portalHelperUrl && (
-              <a
-                href={portalHelperUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex items-center gap-1 px-2.5 py-1 bg-sky-600 hover:bg-sky-500 text-white font-medium rounded-md"
-              >
-                <ExternalLink className="w-3 h-3" />
-                <span>1. Abrir portal y bajar ZIP → 2. Importar aquí</span>
-              </a>
-            )}
-            <button onClick={() => { setStatusMessage(null); setPortalHelperUrl(null); }} className="p-0.5 hover:opacity-75">
-              <X className="w-3.5 h-3.5" />
-            </button>
-          </div>
+          <button onClick={() => setStatusMessage(null)} className="p-0.5 hover:opacity-75">
+            <X className="w-3.5 h-3.5" />
+          </button>
         </div>
       )}
 
@@ -1176,6 +1165,41 @@ export default function DicomViewerApp() {
             <span className="text-[11px] font-mono text-slate-300 min-w-[42px] text-right">
               {currentSliceIdx + 1}/{slices.length}
             </span>
+          </div>
+        )}
+
+        {/* PORTAL INTEGRADO DENTRO DE LA APK (SIN SALIR DE LA APP) */}
+        {inAppPortalUrl && (
+          <div className="absolute inset-0 z-40 flex flex-col bg-slate-950">
+            <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 bg-sky-950 border-b border-sky-700 text-xs">
+              <div className="flex items-center gap-2 text-sky-200">
+                <Globe className="w-4 h-4 text-sky-400 shrink-0" />
+                <span>
+                  <b>Portal Web Integrado:</b> Descarga el DICOM/ZIP desde aquí abajo y luego toca <b>Cargar archivo bajado</b>.
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  className="flex items-center gap-1 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg shadow"
+                >
+                  <Upload className="w-3.5 h-3.5" />
+                  <span>Cargar archivo bajado</span>
+                </button>
+                <button
+                  onClick={() => setInAppPortalUrl(null)}
+                  className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg"
+                >
+                  Cerrar Portal
+                </button>
+              </div>
+            </div>
+            <iframe
+              src={inAppPortalUrl}
+              title="Portal DICOM Integrado"
+              className="flex-1 w-full h-full border-0 bg-white"
+              allow="fullscreen; downloads"
+            />
           </div>
         )}
       </main>
