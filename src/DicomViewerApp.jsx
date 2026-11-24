@@ -1,9 +1,11 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import JSZip from 'jszip';
+import { CapacitorHttp } from '@capacitor/core';
 import {
   Upload, Link as LinkIcon, Sun, Contrast, ZoomIn, Move, Ruler,
   RotateCw, FlipHorizontal, RefreshCw, Play, Pause, Share2,
   FolderDown, Trash2, CheckCircle2, Wifi, WifiOff, Plus, X,
-  FileText, Sliders, ChevronLeft, ChevronRight, Download, ShieldCheck
+  FileText, Sliders, ChevronLeft, ChevronRight, Download, ShieldCheck, ExternalLink
 } from 'lucide-react';
 
 // ==========================================
@@ -58,13 +60,86 @@ async function deleteStudyFromDB(id) {
 }
 
 // ==========================================
-// 2. PARSER BINARIO DICOM (8 / 16 BITS + HU)
+// 2. DESCARGA NATIVA (BYPASS CORS) Y EXTRACTOR
+// ==========================================
+function base64ToArrayBuffer(base64) {
+  const binaryString = atob(base64);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
+async function nativeFetchArrayBuffer(url) {
+  try {
+    // Usar CapacitorHttp nativo en Android para evitar bloqueos CORS
+    const res = await CapacitorHttp.get({
+      url,
+      responseType: 'arraybuffer',
+      headers: {
+        'Accept': 'application/dicom, application/zip, application/octet-stream, text/html, */*',
+      },
+    });
+    if (res.status >= 400) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    if (typeof res.data === 'string') {
+      // Puede venir en base64 si es binario o como texto HTML si es portal web
+      const trimmed = res.data.trim();
+      if (trimmed.startsWith('<!DOCTYPE') || trimmed.startsWith('<html') || trimmed.startsWith('{')) {
+        return { isText: true, text: res.data };
+      }
+      return { isText: false, buffer: base64ToArrayBuffer(res.data) };
+    }
+    return { isText: false, buffer: res.data };
+  } catch (nativeErr) {
+    // Fallback a fetch estándar en navegador web
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const contentType = response.headers.get('content-type') || '';
+    if (contentType.includes('text/html') || contentType.includes('application/json')) {
+      return { isText: true, text: await response.text() };
+    }
+    return { isText: false, buffer: await response.arrayBuffer() };
+  }
+}
+
+async function extractBuffersFromZip(zipBuffer) {
+  const zip = await JSZip.loadAsync(zipBuffer);
+  const dcmBuffers = [];
+  const entries = Object.values(zip.files).filter((f) => !f.dir && !f.name.startsWith('__MACOSX'));
+
+  for (const entry of entries) {
+    const lower = entry.name.toLowerCase();
+    // Ignorar archivos de sistema o imágenes web comunes; procesar .dcm o archivos sin extensión DICOMDIR/series
+    if (lower.endsWith('.txt') || lower.endsWith('.xml') || lower.endsWith('.json') || lower.endsWith('.html') || lower.endsWith('.exe')) {
+      continue;
+    }
+    const buf = await entry.async('arraybuffer');
+    if (buf.byteLength > 256) {
+      try {
+        parseDicomArrayBuffer(buf);
+        dcmBuffers.push(buf);
+      } catch (_) {
+        // No es un archivo DICOM válido, omitir
+      }
+    }
+  }
+  if (dcmBuffers.length === 0) {
+    throw new Error('No se encontraron archivos DICOM válidos dentro del archivo ZIP.');
+  }
+  return dcmBuffers;
+}
+
+// ==========================================
+// 3. PARSER BINARIO DICOM (8 / 16 BITS + HU)
 // ==========================================
 function parseDicomArrayBuffer(buffer) {
   const dataView = new DataView(buffer);
   const uint8 = new Uint8Array(buffer);
 
-  // Verificar encabezado DICM en byte 128
   let offset = 128;
   let hasPreamble = false;
   if (buffer.byteLength > 132) {
@@ -79,7 +154,7 @@ function parseDicomArrayBuffer(buffer) {
   let rows = 512;
   let cols = 512;
   let bitsAllocated = 16;
-  let pixelRepresentation = 0; // 0 = unsigned, 1 = signed
+  let pixelRepresentation = 0;
   let rescaleSlope = 1;
   let rescaleIntercept = 0;
   let windowCenter = null;
@@ -93,7 +168,6 @@ function parseDicomArrayBuffer(buffer) {
   let studyDescription = 'Estudio DICOM';
   let instanceNumber = 1;
   let pixelDataOffset = null;
-  let pixelDataLength = null;
 
   const explicitVRs = new Set([
     'AE', 'AS', 'AT', 'CS', 'DA', 'DS', 'DT', 'FL', 'FD', 'IS', 'LO', 'LT',
@@ -148,17 +222,12 @@ function parseDicomArrayBuffer(buffer) {
 
     if (group === 0x7FE0 && element === 0x0010) {
       pixelDataOffset = offset;
-      pixelDataLength = length === 0xFFFFFFFF ? buffer.byteLength - offset : length;
       break;
     }
 
-    if (length === 0xFFFFFFFF) {
-      continue;
-    }
-
+    if (length === 0xFFFFFFFF) continue;
     if (offset + length > buffer.byteLength) break;
 
-    // Extraer etiquetas relevantes
     if (group === 0x0010 && element === 0x0010) {
       patientName = readString(offset, length).replace(/\^+/g, ' ') || patientName;
     } else if (group === 0x0010 && element === 0x0020) {
@@ -262,7 +331,7 @@ function parseDicomArrayBuffer(buffer) {
 }
 
 // ==========================================
-// 3. GENERADOR DE ESTUDIO DE DEMOSTRACIÓN (TC TÓRAX)
+// 4. GENERADOR DE ESTUDIO DE DEMOSTRACIÓN
 // ==========================================
 function generateDemoStudy() {
   const slices = [];
@@ -272,64 +341,50 @@ function generateDemoStudy() {
 
   for (let s = 0; s < totalSlices; s++) {
     const huData = new Float32Array(rows * cols);
-    const zFactor = (s - totalSlices / 2) / (totalSlices / 2); // -1 a 1
+    const zFactor = (s - totalSlices / 2) / (totalSlices / 2);
 
     for (let y = 0; y < rows; y++) {
       for (let x = 0; x < cols; x++) {
         const idx = y * cols + x;
         const nx = (x - cols / 2) / (cols / 2);
         const ny = (y - rows / 2) / (rows / 2);
-
-        // Aire exterior (-1000 HU)
         let hu = -1000;
 
-        // Contorno torácico (elipse tejido blando ~45 HU)
         const bodyDist = (nx * nx) / 0.72 + (ny * ny) / 0.48;
         if (bodyDist < 1.0) {
           hu = 45 + (Math.sin(x * 0.2) * 5);
+          if (bodyDist > 0.85) hu = -90;
 
-          // Grasa subcutánea (-90 HU)
-          if (bodyDist > 0.85) {
-            hu = -90;
-          }
-
-          // Pulmón derecho e izquierdo (-780 HU)
           const lungScale = 1 - Math.abs(zFactor) * 0.25;
           const rLung = ((nx + 0.34) ** 2) / (0.16 * lungScale) + ((ny + 0.02) ** 2) / (0.24 * lungScale);
           const lLung = ((nx - 0.34) ** 2) / (0.16 * lungScale) + ((ny + 0.02) ** 2) / (0.24 * lungScale);
 
           if (rLung < 1.0 || lLung < 1.0) {
             hu = -780 + Math.cos(x * 0.35) * Math.sin(y * 0.35) * 45;
-            // Nódulo pulmonar simulado en cortes centrales
             if (s >= 4 && s <= 6) {
               const nodDist = (nx - 0.32) ** 2 + (ny - 0.05) ** 2;
               if (nodDist < 0.0025) hu = 35;
             }
           }
 
-          // Corazón / Mediastino (60 HU + contraste 180 HU)
           const heartDist = ((nx - 0.06) ** 2) / 0.045 + ((ny + 0.08) ** 2) / 0.055;
           if (heartDist < 1.0) {
             hu = 65;
             if (heartDist < 0.45) hu = 190;
           }
 
-          // Aorta descendente (210 HU)
           const aortaDist = ((nx - 0.08) ** 2) + ((ny - 0.22) ** 2);
           if (aortaDist < 0.004) hu = 210;
 
-          // Columna vertebral (Hueso cortical ~850 HU)
           const spineDist = ((nx) ** 2) / 0.015 + ((ny - 0.32) ** 2) / 0.012;
           if (spineDist < 1.0) {
             hu = 850;
-            if (spineDist < 0.35) hu = 30; // Canal medular
+            if (spineDist < 0.35) hu = 30;
           }
 
-          // Esternón
           const sternumDist = ((nx) ** 2) / 0.012 + ((ny + 0.42) ** 2) / 0.004;
           if (sternumDist < 1.0) hu = 720;
         }
-
         huData[idx] = hu;
       }
     }
@@ -358,7 +413,7 @@ function generateDemoStudy() {
 }
 
 // ==========================================
-// 4. COMPONENTE PRINCIPAL DE LA APLICACIÓN
+// 5. COMPONENTE PRINCIPAL
 // ==========================================
 const WINDOW_PRESETS = [
   { name: 'Por defecto', wc: null, ww: null },
@@ -369,12 +424,10 @@ const WINDOW_PRESETS = [
 ];
 
 export default function DicomViewerApp() {
-  // Estado de la serie actual
   const [slices, setSlices] = useState([]);
   const [currentSliceIdx, setCurrentSliceIdx] = useState(0);
-  const [rawBuffers, setRawBuffers] = useState([]); // Para guardar en IndexedDB
+  const [rawBuffers, setRawBuffers] = useState([]);
 
-  // Estado de renderizado y cámara
   const [windowCenter, setWindowCenter] = useState(-600);
   const [windowWidth, setWindowWidth] = useState(1500);
   const [zoom, setZoom] = useState(1);
@@ -383,18 +436,17 @@ export default function DicomViewerApp() {
   const [flipH, setFlipH] = useState(false);
   const [invertColors, setInvertColors] = useState(false);
 
-  // Herramientas e interacción
-  const [activeTool, setActiveTool] = useState('wl'); // 'wl' | 'pan' | 'zoom' | 'measure'
+  const [activeTool, setActiveTool] = useState('wl');
   const [measurements, setMeasurements] = useState([]);
   const [activeMeasure, setActiveMeasure] = useState(null);
   const [isPlaying, setIsPlaying] = useState(false);
 
-  // URLs, Descarga Offline y Biblioteca
   const [urlInput, setUrlInput] = useState('');
   const [batchUrlsText, setBatchUrlsText] = useState('');
   const [showBatchModal, setShowBatchModal] = useState(false);
   const [showOfflineModal, setShowOfflineModal] = useState(false);
   const [showShareModal, setShowShareModal] = useState(false);
+  const [portalHelperUrl, setPortalHelperUrl] = useState(null);
   const [savedStudies, setSavedStudies] = useState([]);
   const [isOnline, setIsOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
   const [statusMessage, setStatusMessage] = useState(null);
@@ -410,7 +462,6 @@ export default function DicomViewerApp() {
 
   const currentSlice = slices[currentSliceIdx] || null;
 
-  // Monitorear estado de conexión (Online / Offline)
   useEffect(() => {
     const handleOnline = () => setIsOnline(true);
     const handleOffline = () => setIsOnline(false);
@@ -423,7 +474,6 @@ export default function DicomViewerApp() {
     };
   }, []);
 
-  // Cargar estudio demo o parámetro ?url= al iniciar
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const queryUrl = params.get('url');
@@ -448,7 +498,6 @@ export default function DicomViewerApp() {
     }
   };
 
-  // Reproducción Cine Loop
   useEffect(() => {
     if (!isPlaying || slices.length <= 1) return;
     const interval = setInterval(() => {
@@ -457,9 +506,6 @@ export default function DicomViewerApp() {
     return () => clearInterval(interval);
   }, [isPlaying, slices.length]);
 
-  // ==========================================
-  // RENDERIZADO EN CANVAS
-  // ==========================================
   const renderCanvas = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas || !currentSlice) return;
@@ -499,7 +545,6 @@ export default function DicomViewerApp() {
     }
     offCtx.putImageData(imgData, 0, 0);
 
-    // Ajustar tamaño del canvas visible al contenedor
     const rect = canvas.parentElement.getBoundingClientRect();
     if (canvas.width !== rect.width || canvas.height !== rect.height) {
       canvas.width = rect.width;
@@ -521,7 +566,6 @@ export default function DicomViewerApp() {
     ctx.imageSmoothingEnabled = true;
     ctx.drawImage(offscreen, -drawW / 2, -drawH / 2, drawW, drawH);
 
-    // Dibujar mediciones en milímetros
     const sliceMeasures = measurements.filter((m) => m.sliceIdx === currentSliceIdx);
     const allMeasures = activeMeasure ? [...sliceMeasures, activeMeasure] : sliceMeasures;
 
@@ -536,13 +580,11 @@ export default function DicomViewerApp() {
       ctx.lineTo(m.x2, m.y2);
       ctx.stroke();
 
-      // Puntos extremos
       ctx.beginPath();
       ctx.arc(m.x1, m.y1, 3.5 / zoom, 0, Math.PI * 2);
       ctx.arc(m.x2, m.y2, 3.5 / zoom, 0, Math.PI * 2);
       ctx.fill();
 
-      // Cálculo distancia real en mm
       const dxPx = (m.x2 - m.x1) / baseScale;
       const dyPx = (m.y2 - m.y1) / baseScale;
       const distMm = Math.sqrt(
@@ -567,9 +609,6 @@ export default function DicomViewerApp() {
     return () => window.removeEventListener('resize', handleResize);
   }, [renderCanvas]);
 
-  // ==========================================
-  // CARGA DE URLS, ARCHIVOS LOCALES Y OFFLINE
-  // ==========================================
   const processBuffers = (buffers, sourceLabel = '') => {
     const parsedSlices = [];
     for (const buf of buffers) {
@@ -597,17 +636,41 @@ export default function DicomViewerApp() {
     if (cleanUrls.length === 0) return;
 
     try {
+      setPortalHelperUrl(null);
       setDownloadProgress({ current: 0, total: cleanUrls.length });
-      const fetchedBuffers = [];
+      let fetchedBuffers = [];
 
       for (let i = 0; i < cleanUrls.length; i++) {
         setDownloadProgress({ current: i + 1, total: cleanUrls.length });
-        const response = await fetch(cleanUrls[i]);
-        if (!response.ok) {
-          throw new Error(`Error HTTP ${response.status} al descargar el corte ${i + 1}`);
+        const result = await nativeFetchArrayBuffer(cleanUrls[i]);
+
+        if (result.isText) {
+          // Intentar extraer enlaces .dcm dentro del HTML/JSON del portal web
+          const matches = result.text.match(/https?:\/\/[^\s"'<>]+?\.dcm(?:\?[^\s"'<>]*)?/gi);
+          if (matches && matches.length > 0) {
+            const uniqueDcms = [...new Set(matches)];
+            for (const dcmUrl of uniqueDcms) {
+              const dcmRes = await nativeFetchArrayBuffer(dcmUrl);
+              if (!dcmRes.isText && dcmRes.buffer) fetchedBuffers.push(dcmRes.buffer);
+            }
+          } else {
+            setPortalHelperUrl(cleanUrls[i]);
+            throw new Error('Esta liga abre un portal web interactivo (no un archivo .dcm directo).');
+          }
+        } else if (result.buffer) {
+          // Verificar si es un archivo ZIP (firma PK 0x50 0x4B)
+          const header = new Uint8Array(result.buffer.slice(0, 4));
+          if (header[0] === 0x50 && header[1] === 0x4B) {
+            const zipDcms = await extractBuffersFromZip(result.buffer);
+            fetchedBuffers.push(...zipDcms);
+          } else {
+            fetchedBuffers.push(result.buffer);
+          }
         }
-        const buf = await response.arrayBuffer();
-        fetchedBuffers.push(buf);
+      }
+
+      if (fetchedBuffers.length === 0) {
+        throw new Error('No se obtuvieron cortes DICOM válidos.');
       }
 
       processBuffers(fetchedBuffers, `Estudio cargado (${fetchedBuffers.length} corte(s))`);
@@ -629,13 +692,13 @@ export default function DicomViewerApp() {
         await refreshSavedStudies();
         setStatusMessage({
           type: 'success',
-          text: 'Estudio descargado y guardado en la memoria de tu tablet para ver sin Internet.',
+          text: 'Estudio descargado y guardado en tu tablet para ver sin Internet.',
         });
       }
     } catch (err) {
       setStatusMessage({
         type: 'error',
-        text: `${err.message}. Verifica que la liga apunte directo a un archivo .dcm y permita CORS.`,
+        text: err.message,
       });
     } finally {
       setDownloadProgress(null);
@@ -648,7 +711,7 @@ export default function DicomViewerApp() {
       if (rawBuffers.length === 0) {
         setStatusMessage({
           type: 'error',
-          text: 'Este es el estudio de demostración. Carga una liga DICOM o un archivo .dcm para guardarlo offline.',
+          text: 'Este es el estudio de demostración. Carga una liga, un .zip o un .dcm para guardarlo offline.',
         });
         return;
       }
@@ -692,16 +755,30 @@ export default function DicomViewerApp() {
     const files = Array.from(fileList);
     if (!files.length) return;
     try {
-      const buffers = await Promise.all(files.map((f) => f.arrayBuffer()));
-      processBuffers(buffers, `${files.length} archivo(s) DICOM cargados localmente`);
+      setDownloadProgress({ current: 1, total: files.length });
+      const allBuffers = [];
+
+      for (let i = 0; i < files.length; i++) {
+        setDownloadProgress({ current: i + 1, total: files.length });
+        const file = files[i];
+        const buf = await file.arrayBuffer();
+        const header = new Uint8Array(buf.slice(0, 4));
+        if (file.name.toLowerCase().endsWith('.zip') || (header[0] === 0x50 && header[1] === 0x4B)) {
+          const extracted = await extractBuffersFromZip(buf);
+          allBuffers.push(...extracted);
+        } else {
+          allBuffers.push(buf);
+        }
+      }
+
+      processBuffers(allBuffers, `${allBuffers.length} corte(s) DICOM listos. Toca "Guardar Offline" para conservarlos.`);
     } catch (err) {
-      setStatusMessage({ type: 'error', text: 'Uno o más archivos no tienen formato DICOM válido.' });
+      setStatusMessage({ type: 'error', text: err.message || 'Archivo no válido.' });
+    } finally {
+      setDownloadProgress(null);
     }
   };
 
-  // ==========================================
-  // EVENTOS DE RATÓN Y GESTOS TÁCTILES (TABLET)
-  // ==========================================
   const getCanvasLocalCoords = (clientX, clientY) => {
     const canvas = canvasRef.current;
     const rect = canvas.getBoundingClientRect();
@@ -766,7 +843,6 @@ export default function DicomViewerApp() {
     dragStateRef.current.isDragging = false;
   };
 
-  // Gestos táctiles (1 dedo herramienta, 2 dedos Pinch-to-Zoom)
   const handleTouchStart = (e) => {
     if (e.touches.length === 2) {
       const dx = e.touches[0].clientX - e.touches[1].clientX;
@@ -826,7 +902,7 @@ export default function DicomViewerApp() {
         if (e.dataTransfer.files?.length) handleLocalFiles(e.dataTransfer.files);
       }}
     >
-      {/* BARRA SUPERIOR: LIGA DICOM + ESTADO OFFLINE */}
+      {/* BARRA SUPERIOR */}
       <header className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 bg-slate-900 border-b border-slate-800">
         <div className="flex items-center gap-2">
           <div className="w-8 h-8 rounded-lg bg-sky-500/20 border border-sky-500/40 flex items-center justify-center text-sky-400 font-bold">
@@ -848,7 +924,7 @@ export default function DicomViewerApp() {
           </div>
         </div>
 
-        {/* Barra para pegar liga DICOM */}
+        {/* Barra para pegar liga DICOM o ZIP */}
         <div className="flex items-center flex-1 max-w-xl gap-1.5">
           <div className="relative flex-1">
             <LinkIcon className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
@@ -856,7 +932,7 @@ export default function DicomViewerApp() {
               type="url"
               value={urlInput}
               onChange={(e) => setUrlInput(e.target.value)}
-              placeholder="Pega aquí la liga del archivo .dcm..."
+              placeholder="Pega la liga .dcm, .zip o del portal..."
               className="w-full pl-8 pr-2 py-1.5 text-xs bg-slate-950 border border-slate-700 rounded-lg text-slate-100 placeholder-slate-500 focus:outline-none focus:border-sky-500"
             />
           </div>
@@ -864,7 +940,6 @@ export default function DicomViewerApp() {
             onClick={() => loadFromUrls([urlInput], true)}
             disabled={!urlInput.trim() || downloadProgress !== null}
             className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium bg-sky-600 hover:bg-sky-500 disabled:opacity-40 rounded-lg text-white transition"
-            title="Descargar estudio y guardarlo para ver sin internet"
           >
             <Download className="w-3.5 h-3.5" />
             <span>Descargar</span>
@@ -872,13 +947,13 @@ export default function DicomViewerApp() {
           <button
             onClick={() => setShowBatchModal(true)}
             className="p-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-slate-300"
-            title="Pegar múltiples ligas (serie completa)"
+            title="Pegar múltiples ligas"
           >
             <Plus className="w-4 h-4" />
           </button>
         </div>
 
-        {/* Botones de Biblioteca Offline y Archivo Local */}
+        {/* Botones de Biblioteca Offline y Archivo Local (.dcm o .zip) */}
         <div className="flex items-center gap-1.5">
           <button
             onClick={() => setShowOfflineModal(true)}
@@ -893,23 +968,23 @@ export default function DicomViewerApp() {
             className="flex items-center gap-1 px-2.5 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-slate-200"
           >
             <Upload className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">Abrir .dcm</span>
+            <span>Abrir .dcm / .zip</span>
           </button>
           <input
             ref={fileInputRef}
             type="file"
             multiple
-            accept=".dcm,application/dicom"
+            accept=".dcm,.zip,application/dicom,application/zip"
             className="hidden"
             onChange={(e) => handleLocalFiles(e.target.files)}
           />
         </div>
       </header>
 
-      {/* NOTIFICACIÓN DE PROGRESO O ESTADO */}
+      {/* PROGRESO */}
       {downloadProgress && (
         <div className="px-4 py-1.5 bg-sky-950 border-b border-sky-800 text-xs text-sky-200 flex items-center justify-between">
-          <span>Descargando corte {downloadProgress.current} de {downloadProgress.total} y guardando offline...</span>
+          <span>Procesando archivo {downloadProgress.current} de {downloadProgress.total}...</span>
           <div className="w-32 h-1.5 bg-sky-900 rounded-full overflow-hidden">
             <div
               className="h-full bg-sky-400 transition-all"
@@ -919,18 +994,32 @@ export default function DicomViewerApp() {
         </div>
       )}
 
+      {/* MENSAJE DE ESTADO O AYUDA PARA PORTAL WEB */}
       {statusMessage && (
         <div
-          className={`px-4 py-1.5 text-xs flex items-center justify-between border-b ${
+          className={`px-4 py-2 text-xs flex flex-wrap items-center justify-between gap-2 border-b ${
             statusMessage.type === 'error'
               ? 'bg-rose-950/90 border-rose-800 text-rose-200'
               : 'bg-emerald-950/90 border-emerald-800 text-emerald-200'
           }`}
         >
           <span>{statusMessage.text}</span>
-          <button onClick={() => setStatusMessage(null)} className="p-0.5 hover:opacity-75">
-            <X className="w-3.5 h-3.5" />
-          </button>
+          <div className="flex items-center gap-2">
+            {portalHelperUrl && (
+              <a
+                href={portalHelperUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-1 px-2.5 py-1 bg-sky-600 hover:bg-sky-500 text-white font-medium rounded-md"
+              >
+                <ExternalLink className="w-3 h-3" />
+                <span>1. Abrir portal y bajar ZIP → 2. Importar aquí</span>
+              </a>
+            )}
+            <button onClick={() => { setStatusMessage(null); setPortalHelperUrl(null); }} className="p-0.5 hover:opacity-75">
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
         </div>
       )}
 
@@ -963,25 +1052,13 @@ export default function DicomViewerApp() {
 
           <div className="h-5 w-px bg-slate-800 mx-1" />
 
-          <button
-            onClick={() => setRotation((r) => (r + 90) % 360)}
-            className="p-1.5 rounded-lg bg-slate-800/70 hover:bg-slate-800 text-slate-300"
-            title="Rotar 90°"
-          >
+          <button onClick={() => setRotation((r) => (r + 90) % 360)} className="p-1.5 rounded-lg bg-slate-800/70 hover:bg-slate-800 text-slate-300" title="Rotar 90°">
             <RotateCw className="w-3.5 h-3.5" />
           </button>
-          <button
-            onClick={() => setFlipH((f) => !f)}
-            className="p-1.5 rounded-lg bg-slate-800/70 hover:bg-slate-800 text-slate-300"
-            title="Voltear horizontal"
-          >
+          <button onClick={() => setFlipH((f) => !f)} className="p-1.5 rounded-lg bg-slate-800/70 hover:bg-slate-800 text-slate-300" title="Voltear">
             <FlipHorizontal className="w-3.5 h-3.5" />
           </button>
-          <button
-            onClick={() => setInvertColors((i) => !i)}
-            className="p-1.5 rounded-lg bg-slate-800/70 hover:bg-slate-800 text-slate-300"
-            title="Invertir escala de grises"
-          >
+          <button onClick={() => setInvertColors((i) => !i)} className="p-1.5 rounded-lg bg-slate-800/70 hover:bg-slate-800 text-slate-300" title="Invertir">
             <Sun className="w-3.5 h-3.5" />
           </button>
           <button
@@ -997,13 +1074,12 @@ export default function DicomViewerApp() {
               setMeasurements([]);
             }}
             className="p-1.5 rounded-lg bg-slate-800/70 hover:bg-slate-800 text-slate-300"
-            title="Restablecer vista"
+            title="Restablecer"
           >
             <RefreshCw className="w-3.5 h-3.5" />
           </button>
         </div>
 
-        {/* Presets de ventana clínica */}
         <div className="flex items-center gap-1 overflow-x-auto">
           <Sliders className="w-3.5 h-3.5 text-slate-400 mr-1 hidden sm:inline" />
           {WINDOW_PRESETS.map((preset) => (
@@ -1025,15 +1101,13 @@ export default function DicomViewerApp() {
           ))}
         </div>
 
-        {/* Acciones de guardado manual y compartir */}
         <div className="flex items-center gap-1.5">
           <button
             onClick={handleSaveCurrentStudyOffline}
             className="flex items-center gap-1 px-2.5 py-1 text-xs bg-slate-800 hover:bg-slate-700 text-emerald-300 border border-slate-700 rounded-lg"
-            title="Guardar estudio actual en la tablet"
           >
             <CheckCircle2 className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">Guardar Offline</span>
+            <span>Guardar Offline</span>
           </button>
           <button
             onClick={() => {
@@ -1043,12 +1117,12 @@ export default function DicomViewerApp() {
             className="flex items-center gap-1 px-2.5 py-1 text-xs bg-slate-800 hover:bg-slate-700 text-sky-300 border border-slate-700 rounded-lg"
           >
             <Share2 className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">Compartir Liga</span>
+            <span className="hidden sm:inline">Compartir</span>
           </button>
         </div>
       </div>
 
-      {/* ÁREA PRINCIPAL DEL VISOR CANVAS */}
+      {/* ÁREA PRINCIPAL CANVAS */}
       <main className="relative flex-1 bg-slate-950 overflow-hidden touch-none">
         <canvas
           ref={canvasRef}
@@ -1063,7 +1137,6 @@ export default function DicomViewerApp() {
           className="w-full h-full block cursor-crosshair"
         />
 
-        {/* OVERLAY METADATOS CLÍNICOS (SUPERIOR IZQUIERDA) */}
         {currentSlice && (
           <div className="pointer-events-none absolute top-3 left-3 text-[11px] leading-relaxed text-sky-300/90 font-mono drop-shadow">
             <div className="font-bold text-white text-xs">{currentSlice.metadata.patientName}</div>
@@ -1073,7 +1146,6 @@ export default function DicomViewerApp() {
           </div>
         )}
 
-        {/* OVERLAY PARÁMETROS DE IMAGEN (INFERIOR IZQUIERDA) */}
         {currentSlice && (
           <div className="pointer-events-none absolute bottom-14 left-3 text-[11px] leading-relaxed text-slate-300 font-mono drop-shadow">
             <div>Corte: {currentSliceIdx + 1} / {slices.length}</div>
@@ -1082,20 +1154,12 @@ export default function DicomViewerApp() {
           </div>
         )}
 
-        {/* CONTROLES DE NAVEGACIÓN DE CORTES (BARRA INFERIOR) */}
         {slices.length > 1 && (
           <div className="absolute bottom-2 left-1/2 -translate-x-1/2 flex items-center gap-2 px-3 py-1.5 bg-slate-900/90 border border-slate-700/80 rounded-full backdrop-blur-sm shadow-lg w-[92%] max-w-md">
-            <button
-              onClick={() => setIsPlaying((p) => !p)}
-              className="p-1 text-sky-400 hover:text-sky-300"
-              title="Reproducir serie"
-            >
+            <button onClick={() => setIsPlaying((p) => !p)} className="p-1 text-sky-400 hover:text-sky-300">
               {isPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
             </button>
-            <button
-              onClick={() => setCurrentSliceIdx((i) => Math.max(0, i - 1))}
-              className="p-1 text-slate-300 hover:text-white"
-            >
+            <button onClick={() => setCurrentSliceIdx((i) => Math.max(0, i - 1))} className="p-1 text-slate-300 hover:text-white">
               <ChevronLeft className="w-4 h-4" />
             </button>
             <input
@@ -1106,10 +1170,7 @@ export default function DicomViewerApp() {
               onChange={(e) => setCurrentSliceIdx(Number(e.target.value))}
               className="flex-1 accent-sky-500 h-1.5 bg-slate-700 rounded-lg cursor-pointer"
             />
-            <button
-              onClick={() => setCurrentSliceIdx((i) => Math.min(slices.length - 1, i + 1))}
-              className="p-1 text-slate-300 hover:text-white"
-            >
+            <button onClick={() => setCurrentSliceIdx((i) => Math.min(slices.length - 1, i + 1))} className="p-1 text-slate-300 hover:text-white">
               <ChevronRight className="w-4 h-4" />
             </button>
             <span className="text-[11px] font-mono text-slate-300 min-w-[42px] text-right">
@@ -1119,7 +1180,7 @@ export default function DicomViewerApp() {
         )}
       </main>
 
-      {/* MODAL: BIBLIOTECA OFFLINE (ESTUDIOS GUARDADOS EN LA TABLET) */}
+      {/* MODAL: BIBLIOTECA OFFLINE */}
       {showOfflineModal && (
         <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4">
           <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-lg w-full p-5 shadow-2xl">
@@ -1137,14 +1198,11 @@ export default function DicomViewerApp() {
               {savedStudies.length === 0 ? (
                 <div className="text-center py-8 text-slate-400 text-xs">
                   Aún no tienes estudios guardados en tu dispositivo.<br />
-                  Pega una liga DICOM arriba y toca <b>Descargar</b> para guardarlo aquí.
+                  Pega una liga o abre un archivo <b>.zip / .dcm</b> y toca <b>Guardar Offline</b>.
                 </div>
               ) : (
                 savedStudies.map((study) => (
-                  <div
-                    key={study.id}
-                    className="flex items-center justify-between p-3 bg-slate-950 border border-slate-800 rounded-xl hover:border-slate-700"
-                  >
+                  <div key={study.id} className="flex items-center justify-between p-3 bg-slate-950 border border-slate-800 rounded-xl">
                     <div className="min-w-0 pr-2">
                       <div className="text-sm font-semibold text-white truncate">{study.patientName}</div>
                       <div className="text-xs text-slate-400 truncate">{study.studyDescription}</div>
@@ -1153,17 +1211,10 @@ export default function DicomViewerApp() {
                       </div>
                     </div>
                     <div className="flex items-center gap-1.5 shrink-0">
-                      <button
-                        onClick={() => handleOpenSavedStudy(study)}
-                        className="px-3 py-1.5 text-xs font-medium bg-sky-600 hover:bg-sky-500 text-white rounded-lg"
-                      >
+                      <button onClick={() => handleOpenSavedStudy(study)} className="px-3 py-1.5 text-xs font-medium bg-sky-600 hover:bg-sky-500 text-white rounded-lg">
                         Abrir
                       </button>
-                      <button
-                        onClick={() => handleDeleteSavedStudy(study.id)}
-                        className="p-1.5 text-rose-400 hover:bg-rose-950 rounded-lg"
-                        title="Eliminar de la memoria"
-                      >
+                      <button onClick={() => handleDeleteSavedStudy(study.id)} className="p-1.5 text-rose-400 hover:bg-rose-950 rounded-lg">
                         <Trash2 className="w-4 h-4" />
                       </button>
                     </div>
@@ -1175,7 +1226,7 @@ export default function DicomViewerApp() {
         </div>
       )}
 
-      {/* MODAL: MÚLTIPLES LIGAS (SERIE COMPLETA) */}
+      {/* MODAL: MÚLTIPLES LIGAS */}
       {showBatchModal && (
         <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4">
           <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-lg w-full p-5 shadow-2xl">
@@ -1188,21 +1239,15 @@ export default function DicomViewerApp() {
                 <X className="w-5 h-5" />
               </button>
             </div>
-            <p className="text-xs text-slate-400 mt-3">
-              Pega una liga por línea (ej. todos los cortes `.dcm` de una tomografía o resonancia). Se descargarán y guardarán juntos para consulta sin Internet.
-            </p>
             <textarea
               rows={6}
               value={batchUrlsText}
               onChange={(e) => setBatchUrlsText(e.target.value)}
               placeholder={"https://servidor.com/estudio/corte01.dcm\nhttps://servidor.com/estudio/corte02.dcm"}
-              className="w-full mt-3 p-2.5 text-xs font-mono bg-slate-950 border border-slate-700 rounded-xl text-slate-100 focus:outline-none focus:border-sky-500"
+              className="w-full mt-3 p-2.5 text-xs font-mono bg-slate-950 border border-slate-700 rounded-xl text-slate-100"
             />
             <div className="flex justify-end gap-2 mt-4">
-              <button
-                onClick={() => setShowBatchModal(false)}
-                className="px-3 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 rounded-lg text-slate-300"
-              >
+              <button onClick={() => setShowBatchModal(false)} className="px-3 py-1.5 text-xs bg-slate-800 rounded-lg text-slate-300">
                 Cancelar
               </button>
               <button
@@ -1220,7 +1265,7 @@ export default function DicomViewerApp() {
         </div>
       )}
 
-      {/* MODAL: COMPARTIR LIGA CON TOKEN */}
+      {/* MODAL: COMPARTIR */}
       {showShareModal && (
         <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4">
           <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-5 shadow-2xl">
@@ -1235,34 +1280,26 @@ export default function DicomViewerApp() {
             </div>
             <div className="mt-3 space-y-3">
               <div>
-                <label className="block text-xs text-slate-400 mb-1">PIN de acceso opcional (4 dígitos):</label>
+                <label className="block text-xs text-slate-400 mb-1">PIN de acceso opcional:</label>
                 <input
                   type="text"
                   maxLength={6}
                   value={sharePin}
-                  onChange={(e) => {
-                    setSharePin(e.target.value);
-                  }}
+                  onChange={(e) => setSharePin(e.target.value)}
                   placeholder="Ej. 1985"
                   className="w-full px-3 py-1.5 text-xs bg-slate-950 border border-slate-700 rounded-lg text-white"
                 />
               </div>
-              <button
-                onClick={generateShareableLink}
-                className="w-full py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-sky-300"
-              >
+              <button onClick={generateShareableLink} className="w-full py-1.5 text-xs font-medium bg-slate-800 border border-slate-700 rounded-lg text-sky-300">
                 Actualizar Enlace
               </button>
-              <div>
-                <label className="block text-xs text-slate-400 mb-1">Liga lista para enviar:</label>
-                <input
-                  type="text"
-                  readOnly
-                  value={generatedLink}
-                  onClick={(e) => e.target.select()}
-                  className="w-full px-3 py-2 text-[11px] font-mono bg-slate-950 border border-slate-700 rounded-lg text-emerald-300"
-                />
-              </div>
+              <input
+                type="text"
+                readOnly
+                value={generatedLink}
+                onClick={(e) => e.target.select()}
+                className="w-full px-3 py-2 text-[11px] font-mono bg-slate-950 border border-slate-700 rounded-lg text-emerald-300"
+              />
             </div>
           </div>
         </div>
