@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import JSZip from 'jszip';
 import { CapacitorHttp } from '@capacitor/core';
+import { Browser } from '@capacitor/browser';
 import {
   Upload, Link as LinkIcon, Sun, Contrast, ZoomIn, Move, Ruler,
   RotateCw, FlipHorizontal, RefreshCw, Play, Pause, Share2,
@@ -60,7 +61,7 @@ async function deleteStudyFromDB(id) {
 }
 
 // ==========================================
-// 2. DESCARGA NATIVA (BYPASS CORS) Y EXTRACTOR
+// 2. DESCARGA NATIVA Y EXTRACTOR DE PORTALES
 // ==========================================
 function base64ToArrayBuffer(base64) {
   const binaryString = atob(base64);
@@ -72,35 +73,80 @@ function base64ToArrayBuffer(base64) {
   return bytes.buffer;
 }
 
-async function nativeFetchArrayBuffer(url) {
+async function nativeFetch(url) {
   try {
     const res = await CapacitorHttp.get({
       url,
       responseType: 'arraybuffer',
       headers: {
-        'Accept': 'application/dicom, application/zip, application/octet-stream, text/html, */*',
+        'Accept': 'application/dicom, application/zip, application/octet-stream, text/html, application/json, */*',
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
       },
     });
     if (res.status >= 400) {
       throw new Error(`HTTP ${res.status}`);
     }
+    const finalUrl = res.url || url;
     if (typeof res.data === 'string') {
       const trimmed = res.data.trim();
       if (trimmed.startsWith('<!DOCTYPE') || trimmed.startsWith('<html') || trimmed.startsWith('{') || trimmed.startsWith('<')) {
-        return { isText: true, text: res.data };
+        return { isText: true, text: res.data, finalUrl };
       }
-      return { isText: false, buffer: base64ToArrayBuffer(res.data) };
+      return { isText: false, buffer: base64ToArrayBuffer(res.data), finalUrl };
     }
-    return { isText: false, buffer: res.data };
+    return { isText: false, buffer: res.data, finalUrl };
   } catch (nativeErr) {
     const response = await fetch(url);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const contentType = response.headers.get('content-type') || '';
     if (contentType.includes('text/html') || contentType.includes('application/json')) {
-      return { isText: true, text: await response.text() };
+      return { isText: true, text: await response.text(), finalUrl: response.url || url };
     }
-    return { isText: false, buffer: await response.arrayBuffer() };
+    return { isText: false, buffer: await response.arrayBuffer(), finalUrl: response.url || url };
   }
+}
+
+async function tryExtractFromPacsPortal(initialUrl, finalUrl, htmlText) {
+  const candidateUrls = new Set();
+
+  // 1. Buscar enlaces directos .dcm o .zip dentro del HTML/JS
+  const directMatches = htmlText.match(/https?:\/\/[^\s"'<>]+?\.(?:dcm|zip)(?:\?[^\s"'<>]*)?/gi);
+  if (directMatches) directMatches.forEach((m) => candidateUrls.add(m));
+
+  // 2. Detectar parámetros de Evacenter / PACS (?studyId=...&ac=...)
+  try {
+    const parsedFinal = new URL(finalUrl || initialUrl);
+    const studyId = parsedFinal.searchParams.get('studyId') || parsedFinal.pathname.split('/').filter(Boolean).pop();
+    const acToken = parsedFinal.searchParams.get('ac') || parsedFinal.searchParams.get('token') || '';
+    const origin = parsedFinal.origin;
+
+    if (studyId && studyId.length > 10) {
+      const q = acToken ? `?ac=${encodeURIComponent(acToken)}` : '';
+      candidateUrls.add(`${origin}/api/v2/studies/${studyId}/download${q}`);
+      candidateUrls.add(`${origin}/api/studies/${studyId}/download${q}`);
+      candidateUrls.add(`${origin}/v2/api/studies/${studyId}/zip${q}`);
+      candidateUrls.add(`${origin}/dicomweb/studies/${studyId}${q}`);
+    }
+  } catch (_) {}
+
+  const collectedBuffers = [];
+  for (const cand of candidateUrls) {
+    try {
+      const res = await nativeFetch(cand);
+      if (!res.isText && res.buffer && res.buffer.byteLength > 512) {
+        const header = new Uint8Array(res.buffer.slice(0, 4));
+        if (header[0] === 0x50 && header[1] === 0x4B) {
+          const zipDcms = await extractBuffersFromZip(res.buffer);
+          collectedBuffers.push(...zipDcms);
+          break;
+        } else {
+          parseDicomArrayBuffer(res.buffer);
+          collectedBuffers.push(res.buffer);
+        }
+      }
+    } catch (_) {}
+  }
+  return collectedBuffers;
 }
 
 async function extractBuffersFromZip(zipBuffer) {
@@ -270,7 +316,7 @@ function parseDicomArrayBuffer(buffer) {
   }
 
   if (pixelDataOffset === null) {
-    throw new Error('La liga abrió un portal web, no un archivo .dcm directo.');
+    throw new Error('No se encontró PixelData válido.');
   }
 
   const totalPixels = rows * cols;
@@ -440,7 +486,7 @@ export default function DicomViewerApp() {
   const [showBatchModal, setShowBatchModal] = useState(false);
   const [showOfflineModal, setShowOfflineModal] = useState(false);
   const [showShareModal, setShowShareModal] = useState(false);
-  const [inAppPortalUrl, setInAppPortalUrl] = useState(null);
+  const [portalUrlReady, setPortalUrlReady] = useState(null);
   const [savedStudies, setSavedStudies] = useState([]);
   const [isOnline, setIsOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
   const [statusMessage, setStatusMessage] = useState(null);
@@ -625,29 +671,42 @@ export default function DicomViewerApp() {
     }
   };
 
+  const openNativeCustomTab = async (targetUrl) => {
+    try {
+      await Browser.open({
+        url: targetUrl,
+        presentationStyle: 'popover',
+        toolbarColor: '#0f172a',
+      });
+    } catch (_) {
+      window.open(targetUrl, '_blank');
+    }
+  };
+
   const loadFromUrls = async (urls, autoSaveOffline = false) => {
     const cleanUrls = urls.map((u) => u.trim()).filter(Boolean);
     if (cleanUrls.length === 0) return;
 
     try {
+      setPortalUrlReady(null);
       setDownloadProgress({ current: 0, total: cleanUrls.length });
       let fetchedBuffers = [];
 
       for (let i = 0; i < cleanUrls.length; i++) {
         setDownloadProgress({ current: i + 1, total: cleanUrls.length });
-        const result = await nativeFetchArrayBuffer(cleanUrls[i]);
+        const result = await nativeFetch(cleanUrls[i]);
 
         if (result.isText) {
-          const matches = result.text.match(/https?:\/\/[^\s"'<>]+?\.dcm(?:\?[^\s"'<>]*)?/gi);
-          if (matches && matches.length > 0) {
-            const uniqueDcms = [...new Set(matches)];
-            for (const dcmUrl of uniqueDcms) {
-              const dcmRes = await nativeFetchArrayBuffer(dcmUrl);
-              if (!dcmRes.isText && dcmRes.buffer) fetchedBuffers.push(dcmRes.buffer);
-            }
+          const extracted = await tryExtractFromPacsPortal(cleanUrls[i], result.finalUrl, result.text);
+          if (extracted.length > 0) {
+            fetchedBuffers.push(...extracted);
           } else {
-            // Abrir el portal dentro de la misma APK
-            setInAppPortalUrl(cleanUrls[i]);
+            // El portal protege los cortes con sesión dinámica: ofrecer abrir Custom Tab nativo dentro de la app
+            setPortalUrlReady(result.finalUrl || cleanUrls[i]);
+            setStatusMessage({
+              type: 'info',
+              text: 'Este portal web requiere descargar el ZIP desde su botón interno. Tócalo aquí para abrirlo dentro de la app:',
+            });
             setDownloadProgress(null);
             return;
           }
@@ -661,17 +720,26 @@ export default function DicomViewerApp() {
               parseDicomArrayBuffer(result.buffer);
               fetchedBuffers.push(result.buffer);
             } catch (_) {
-              // Si lo descargado fue HTML codificado como buffer, abrir en el portal interno de la app
-              setInAppPortalUrl(cleanUrls[i]);
-              setDownloadProgress(null);
-              return;
+              const textFallback = new TextDecoder().decode(result.buffer.slice(0, 4000));
+              const extracted = await tryExtractFromPacsPortal(cleanUrls[i], result.finalUrl, textFallback);
+              if (extracted.length > 0) {
+                fetchedBuffers.push(...extracted);
+              } else {
+                setPortalUrlReady(result.finalUrl || cleanUrls[i]);
+                setStatusMessage({
+                  type: 'info',
+                  text: 'Portal web detectado. Abre la ventana integrada, descarga el DICOM/ZIP y cárgalo aquí:',
+                });
+                setDownloadProgress(null);
+                return;
+              }
             }
           }
         }
       }
 
       if (fetchedBuffers.length === 0) {
-        setInAppPortalUrl(cleanUrls[0]);
+        setPortalUrlReady(cleanUrls[0]);
         setDownloadProgress(null);
         return;
       }
@@ -699,8 +767,11 @@ export default function DicomViewerApp() {
         });
       }
     } catch (err) {
-      // Ante cualquier liga de portal web, abrirla dentro del visor integrado de la APK
-      setInAppPortalUrl(cleanUrls[0]);
+      setPortalUrlReady(cleanUrls[0]);
+      setStatusMessage({
+        type: 'info',
+        text: 'Liga de portal web detectada. Ábrela en la pestaña integrada para bajar el archivo y guardarlo offline:',
+      });
     } finally {
       setDownloadProgress(null);
     }
@@ -772,7 +843,7 @@ export default function DicomViewerApp() {
         }
       }
 
-      setInAppPortalUrl(null);
+      setPortalUrlReady(null);
       processBuffers(allBuffers, `${allBuffers.length} corte(s) DICOM cargados. Toca "Guardar Offline" para conservarlos.`);
     } catch (err) {
       setStatusMessage({ type: 'error', text: err.message || 'Archivo no válido.' });
@@ -996,19 +1067,41 @@ export default function DicomViewerApp() {
         </div>
       )}
 
-      {/* MENSAJE DE ESTADO */}
+      {/* MENSAJE DE ESTADO + BOTÓN DE PESTANA NATIVA SUPERPUESTA */}
       {statusMessage && (
         <div
-          className={`px-4 py-1.5 text-xs flex items-center justify-between border-b ${
+          className={`px-4 py-2 text-xs flex flex-wrap items-center justify-between gap-2 border-b ${
             statusMessage.type === 'error'
               ? 'bg-rose-950/90 border-rose-800 text-rose-200'
+              : statusMessage.type === 'info'
+              ? 'bg-sky-950 border-sky-700 text-sky-100'
               : 'bg-emerald-950/90 border-emerald-800 text-emerald-200'
           }`}
         >
           <span>{statusMessage.text}</span>
-          <button onClick={() => setStatusMessage(null)} className="p-0.5 hover:opacity-75">
-            <X className="w-3.5 h-3.5" />
-          </button>
+          <div className="flex items-center gap-2">
+            {portalUrlReady && (
+              <>
+                <button
+                  onClick={() => openNativeCustomTab(portalUrlReady)}
+                  className="flex items-center gap-1 px-3 py-1.5 bg-sky-600 hover:bg-sky-500 text-white font-semibold rounded-lg shadow"
+                >
+                  <Globe className="w-3.5 h-3.5" />
+                  <span>1. Abrir Portal Aquí</span>
+                </button>
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  className="flex items-center gap-1 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg shadow"
+                >
+                  <Upload className="w-3.5 h-3.5" />
+                  <span>2. Cargar ZIP/DCM bajado</span>
+                </button>
+              </>
+            )}
+            <button onClick={() => { setStatusMessage(null); setPortalUrlReady(null); }} className="p-0.5 hover:opacity-75">
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
         </div>
       )}
 
@@ -1165,41 +1258,6 @@ export default function DicomViewerApp() {
             <span className="text-[11px] font-mono text-slate-300 min-w-[42px] text-right">
               {currentSliceIdx + 1}/{slices.length}
             </span>
-          </div>
-        )}
-
-        {/* PORTAL INTEGRADO DENTRO DE LA APK (SIN SALIR DE LA APP) */}
-        {inAppPortalUrl && (
-          <div className="absolute inset-0 z-40 flex flex-col bg-slate-950">
-            <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 bg-sky-950 border-b border-sky-700 text-xs">
-              <div className="flex items-center gap-2 text-sky-200">
-                <Globe className="w-4 h-4 text-sky-400 shrink-0" />
-                <span>
-                  <b>Portal Web Integrado:</b> Descarga el DICOM/ZIP desde aquí abajo y luego toca <b>Cargar archivo bajado</b>.
-                </span>
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => fileInputRef.current?.click()}
-                  className="flex items-center gap-1 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg shadow"
-                >
-                  <Upload className="w-3.5 h-3.5" />
-                  <span>Cargar archivo bajado</span>
-                </button>
-                <button
-                  onClick={() => setInAppPortalUrl(null)}
-                  className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg"
-                >
-                  Cerrar Portal
-                </button>
-              </div>
-            </div>
-            <iframe
-              src={inAppPortalUrl}
-              title="Portal DICOM Integrado"
-              className="flex-1 w-full h-full border-0 bg-white"
-              allow="fullscreen; downloads"
-            />
           </div>
         )}
       </main>
