@@ -23,39 +23,12 @@ jobs:
         run: |
           npm install
           npm run build
-      - name: Crear proyecto Android y configurar WebView
+      - name: Crear proyecto Android con Capacitor
         run: |
           npx cap add android
           npx cap sync android
-          python3 -c '
-import glob
-
-main_act = glob.glob("android/app/src/main/java/**/MainActivity.java", recursive=True)[0]
-with open(main_act, "r") as f:
-    lines = f.readlines()
-
-pkg_line = lines[0] if lines and lines[0].startswith("package ") else "package com.medview.dicom;\n"
-
-injection = pkg_line + """
-import android.webkit.WebSettings;
-import android.webkit.WebView;
-import com.getcapacitor.BridgeActivity;
-
-public class MainActivity extends BridgeActivity {
-    @Override
-    public void onStart() {
-        super.onStart();
-        WebView webView = getBridge().getWebView();
-        WebSettings settings = webView.getSettings();
-        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
-        settings.setAllowFileAccess(true);
-        settings.setAllowContentAccess(true);
-    }
-}
-"""
-with open(main_act, "w") as f:
-    f.write(injection)
-'
+      - name: Compilar APK Debug
+        run: |
           cd android
           chmod +x gradlew
           ./gradlew assembleDebug
