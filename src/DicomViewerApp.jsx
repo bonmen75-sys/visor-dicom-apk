@@ -6,7 +6,7 @@ import {
   Upload, Link as LinkIcon, Sun, Contrast, ZoomIn, Move, Ruler,
   RotateCw, FlipHorizontal, RefreshCw, Play, Pause, Share2,
   FolderDown, Trash2, CheckCircle2, Wifi, WifiOff, Plus, X,
-  FileText, Sliders, ChevronLeft, ChevronRight, Download, ShieldCheck, Globe
+  FileText, Sliders, ChevronLeft, ChevronRight, Download, ShieldCheck, Globe, Camera
 } from 'lucide-react';
 
 // ==========================================
@@ -61,7 +61,7 @@ async function deleteStudyFromDB(id) {
 }
 
 // ==========================================
-// 2. DESCARGA NATIVA Y EXTRACTOR DE PORTALES
+// 2. DESCARGA NATIVA Y EXTRACTOR DE EVACENTER
 // ==========================================
 function base64ToArrayBuffer(base64) {
   const binaryString = atob(base64);
@@ -83,9 +83,7 @@ async function nativeFetch(url) {
         'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
       },
     });
-    if (res.status >= 400) {
-      throw new Error(`HTTP ${res.status}`);
-    }
+    if (res.status >= 400) throw new Error(`HTTP ${res.status}`);
     const finalUrl = res.url || url;
     if (typeof res.data === 'string') {
       const trimmed = res.data.trim();
@@ -106,26 +104,42 @@ async function nativeFetch(url) {
   }
 }
 
-async function tryExtractFromPacsPortal(initialUrl, finalUrl, htmlText) {
+async function tryExtractFromEvacenterOrPacs(initialUrl, finalUrl, htmlText) {
   const candidateUrls = new Set();
 
-  // 1. Buscar enlaces directos .dcm o .zip dentro del HTML/JS
+  // 1. Enlaces directos .dcm o .zip en el HTML/JS
   const directMatches = htmlText.match(/https?:\/\/[^\s"'<>]+?\.(?:dcm|zip)(?:\?[^\s"'<>]*)?/gi);
   if (directMatches) directMatches.forEach((m) => candidateUrls.add(m));
 
-  // 2. Detectar parámetros de Evacenter / PACS (?studyId=...&ac=...)
+  // 2. Extraer studyId y token ac de Evacenter (pacs.evacenter.com/v2/mobile_viewer/?studyId=...&ac=...)
   try {
-    const parsedFinal = new URL(finalUrl || initialUrl);
-    const studyId = parsedFinal.searchParams.get('studyId') || parsedFinal.pathname.split('/').filter(Boolean).pop();
-    const acToken = parsedFinal.searchParams.get('ac') || parsedFinal.searchParams.get('token') || '';
-    const origin = parsedFinal.origin;
+    const parsed = new URL(finalUrl || initialUrl);
+    const studyId = parsed.searchParams.get('studyId') || parsed.pathname.split('/').filter(Boolean).pop();
+    const ac = parsed.searchParams.get('ac') || '';
+    const origin = parsed.origin;
 
     if (studyId && studyId.length > 10) {
-      const q = acToken ? `?ac=${encodeURIComponent(acToken)}` : '';
+      // Consultar metadatos JSON del estudio en Evacenter
+      const metaEndpoints = [
+        `${origin}/v2/api/studies/${studyId}${ac ? `?ac=${encodeURIComponent(ac)}` : ''}`,
+        `${origin}/api/v2/studies/${studyId}${ac ? `?ac=${encodeURIComponent(ac)}` : ''}`,
+        `${origin}/api/studies/${studyId}${ac ? `?ac=${encodeURIComponent(ac)}` : ''}`,
+      ];
+
+      for (const ep of metaEndpoints) {
+        try {
+          const metaRes = await nativeFetch(ep);
+          if (metaRes.isText && metaRes.text) {
+            const urlsInJson = metaRes.text.match(/https?:\/\/[^\s"'<>]+/gi);
+            if (urlsInJson) urlsInJson.forEach((u) => candidateUrls.add(u));
+          }
+        } catch (_) {}
+      }
+
+      const q = ac ? `?ac=${encodeURIComponent(ac)}` : '';
+      candidateUrls.add(`${origin}/v2/api/studies/${studyId}/download${q}`);
       candidateUrls.add(`${origin}/api/v2/studies/${studyId}/download${q}`);
       candidateUrls.add(`${origin}/api/studies/${studyId}/download${q}`);
-      candidateUrls.add(`${origin}/v2/api/studies/${studyId}/zip${q}`);
-      candidateUrls.add(`${origin}/dicomweb/studies/${studyId}${q}`);
     }
   } catch (_) {}
 
@@ -368,6 +382,55 @@ function parseDicomArrayBuffer(buffer) {
       instanceNumber,
     },
   };
+}
+
+// Convertir imagen estándar (PNG/JPG/Captura de estudio) a corte clínico compatible con Window/Level y medición
+async function parseImageFileToSlice(file) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      const cols = img.width;
+      const rows = img.height;
+      const canvas = document.createElement('canvas');
+      canvas.width = cols;
+      canvas.height = rows;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0);
+      const imgData = ctx.getImageData(0, 0, cols, rows).data;
+      const huData = new Float32Array(cols * rows);
+      for (let i = 0; i < cols * rows; i++) {
+        const p = i * 4;
+        const lum = 0.299 * imgData[p] + 0.587 * imgData[p + 1] + 0.114 * imgData[p + 2];
+        huData[i] = lum;
+      }
+      URL.revokeObjectURL(url);
+      resolve({
+        rows,
+        cols,
+        huData,
+        minVal: 0,
+        maxVal: 255,
+        defaultWindowCenter: 128,
+        defaultWindowWidth: 255,
+        pixelSpacing: [0.25, 0.25],
+        invert: false,
+        metadata: {
+          patientName: file.name.replace(/\.[^/.]+$/, '').toUpperCase(),
+          patientId: 'IMG-OFFLINE',
+          studyDate: new Date().toLocaleDateString('es-MX'),
+          modality: 'US / IMG',
+          studyDescription: 'Estudio Importado Offline',
+          instanceNumber: 1,
+        },
+      });
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('No se pudo leer la imagen.'));
+    };
+    img.src = url;
+  });
 }
 
 // ==========================================
@@ -649,15 +712,10 @@ export default function DicomViewerApp() {
     return () => window.removeEventListener('resize', handleResize);
   }, [renderCanvas]);
 
-  const processBuffers = (buffers, sourceLabel = '') => {
-    const parsedSlices = [];
-    for (const buf of buffers) {
-      parsedSlices.push(parseDicomArrayBuffer(buf));
-    }
+  const processSlicesDirectly = (parsedSlices, buffersToSave, sourceLabel = '') => {
     parsedSlices.sort((a, b) => a.metadata.instanceNumber - b.metadata.instanceNumber);
-
     setSlices(parsedSlices);
-    setRawBuffers(buffers);
+    setRawBuffers(buffersToSave);
     setCurrentSliceIdx(0);
     setWindowCenter(parsedSlices[0].defaultWindowCenter);
     setWindowWidth(parsedSlices[0].defaultWindowWidth);
@@ -669,6 +727,11 @@ export default function DicomViewerApp() {
     if (sourceLabel) {
       setStatusMessage({ type: 'success', text: sourceLabel });
     }
+  };
+
+  const processBuffers = (buffers, sourceLabel = '') => {
+    const parsedSlices = buffers.map((buf) => parseDicomArrayBuffer(buf));
+    processSlicesDirectly(parsedSlices, buffers, sourceLabel);
   };
 
   const openNativeCustomTab = async (targetUrl) => {
@@ -697,15 +760,14 @@ export default function DicomViewerApp() {
         const result = await nativeFetch(cleanUrls[i]);
 
         if (result.isText) {
-          const extracted = await tryExtractFromPacsPortal(cleanUrls[i], result.finalUrl, result.text);
+          const extracted = await tryExtractFromEvacenterOrPacs(cleanUrls[i], result.finalUrl, result.text);
           if (extracted.length > 0) {
             fetchedBuffers.push(...extracted);
           } else {
-            // El portal protege los cortes con sesión dinámica: ofrecer abrir Custom Tab nativo dentro de la app
             setPortalUrlReady(result.finalUrl || cleanUrls[i]);
             setStatusMessage({
               type: 'info',
-              text: 'Este portal web requiere descargar el ZIP desde su botón interno. Tócalo aquí para abrirlo dentro de la app:',
+              text: 'Este portal web no permite descarga directa de DICOM. Ábrelo aquí, captura las imágenes o baja el archivo e impórtalo:',
             });
             setDownloadProgress(null);
             return;
@@ -721,14 +783,14 @@ export default function DicomViewerApp() {
               fetchedBuffers.push(result.buffer);
             } catch (_) {
               const textFallback = new TextDecoder().decode(result.buffer.slice(0, 4000));
-              const extracted = await tryExtractFromPacsPortal(cleanUrls[i], result.finalUrl, textFallback);
+              const extracted = await tryExtractFromEvacenterOrPacs(cleanUrls[i], result.finalUrl, textFallback);
               if (extracted.length > 0) {
                 fetchedBuffers.push(...extracted);
               } else {
                 setPortalUrlReady(result.finalUrl || cleanUrls[i]);
                 setStatusMessage({
                   type: 'info',
-                  text: 'Portal web detectado. Abre la ventana integrada, descarga el DICOM/ZIP y cárgalo aquí:',
+                  text: 'Portal de solo lectura detectado. Abre el portal aquí, guarda/captura las imágenes y cárgalas para verlas sin Internet:',
                 });
                 setDownloadProgress(null);
                 return;
@@ -770,7 +832,7 @@ export default function DicomViewerApp() {
       setPortalUrlReady(cleanUrls[0]);
       setStatusMessage({
         type: 'info',
-        text: 'Liga de portal web detectada. Ábrela en la pestaña integrada para bajar el archivo y guardarlo offline:',
+        text: 'Liga de portal web detectada. Ábrela aquí, descarga o captura las imágenes y cárgalas en la app:',
       });
     } finally {
       setDownloadProgress(null);
@@ -780,24 +842,33 @@ export default function DicomViewerApp() {
   const handleSaveCurrentStudyOffline = async () => {
     if (!currentSlice) return;
     try {
-      if (rawBuffers.length === 0) {
+      if (rawBuffers.length === 0 && slices.length === 0) {
         setStatusMessage({
           type: 'error',
-          text: 'Este es el estudio de demostración. Carga una liga, un .zip o un .dcm para guardarlo offline.',
+          text: 'Carga un estudio DICOM, ZIP o imagen para guardarlo offline.',
         });
         return;
       }
-      const totalBytes = rawBuffers.reduce((acc, b) => acc + b.byteLength, 0);
+      // Si son imágenes importadas sin buffer binario DICOM, serializar su huData
+      const serializedSlices = slices.map((s) => ({
+        ...s,
+        huData: Array.from(s.huData),
+      }));
+      const totalBytes = rawBuffers.length > 0
+        ? rawBuffers.reduce((acc, b) => acc + b.byteLength, 0)
+        : slices.reduce((acc, s) => acc + s.huData.byteLength, 0);
+
       await saveStudyToDB({
         id: `study_${Date.now()}`,
         patientName: currentSlice.metadata.patientName,
         modality: currentSlice.metadata.modality,
         studyDate: currentSlice.metadata.studyDate,
         studyDescription: currentSlice.metadata.studyDescription,
-        sliceCount: rawBuffers.length,
+        sliceCount: slices.length,
         sizeMB: (totalBytes / (1024 * 1024)).toFixed(2),
         savedAt: Date.now(),
         buffers: rawBuffers,
+        serializedSlices: rawBuffers.length === 0 ? serializedSlices : null,
       });
       await refreshSavedStudies();
       setStatusMessage({
@@ -811,7 +882,15 @@ export default function DicomViewerApp() {
 
   const handleOpenSavedStudy = (study) => {
     try {
-      processBuffers(study.buffers, `Abierto desde memoria offline: ${study.patientName}`);
+      if (study.buffers && study.buffers.length > 0) {
+        processBuffers(study.buffers, `Abierto desde memoria offline: ${study.patientName}`);
+      } else if (study.serializedSlices) {
+        const restored = study.serializedSlices.map((s) => ({
+          ...s,
+          huData: new Float32Array(s.huData),
+        }));
+        processSlicesDirectly(restored, [], `Abierto desde memoria offline: ${study.patientName}`);
+      }
       setShowOfflineModal(false);
     } catch (e) {
       setStatusMessage({ type: 'error', text: 'Error al abrir el estudio guardado.' });
@@ -828,25 +907,47 @@ export default function DicomViewerApp() {
     if (!files.length) return;
     try {
       setDownloadProgress({ current: 1, total: files.length });
-      const allBuffers = [];
+      const dcmBuffers = [];
+      const imgSlices = [];
 
       for (let i = 0; i < files.length; i++) {
         setDownloadProgress({ current: i + 1, total: files.length });
         const file = files[i];
+        const lower = file.name.toLowerCase();
+
+        if (lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.png') || lower.endsWith('.webp')) {
+          const s = await parseImageFileToSlice(file);
+          s.metadata.instanceNumber = i + 1;
+          imgSlices.push(s);
+          continue;
+        }
+
         const buf = await file.arrayBuffer();
         const header = new Uint8Array(buf.slice(0, 4));
-        if (file.name.toLowerCase().endsWith('.zip') || (header[0] === 0x50 && header[1] === 0x4B)) {
+        if (lower.endsWith('.zip') || (header[0] === 0x50 && header[1] === 0x4B)) {
           const extracted = await extractBuffersFromZip(buf);
-          allBuffers.push(...extracted);
+          dcmBuffers.push(...extracted);
         } else {
-          allBuffers.push(buf);
+          try {
+            parseDicomArrayBuffer(buf);
+            dcmBuffers.push(buf);
+          } catch (_) {
+            // Intentar como imagen si no tenía extensión
+            const s = await parseImageFileToSlice(file);
+            s.metadata.instanceNumber = i + 1;
+            imgSlices.push(s);
+          }
         }
       }
 
       setPortalUrlReady(null);
-      processBuffers(allBuffers, `${allBuffers.length} corte(s) DICOM cargados. Toca "Guardar Offline" para conservarlos.`);
+      if (dcmBuffers.length > 0) {
+        processBuffers(dcmBuffers, `${dcmBuffers.length} corte(s) DICOM cargados. Toca "Guardar Offline" para conservarlos.`);
+      } else if (imgSlices.length > 0) {
+        processSlicesDirectly(imgSlices, [], `${imgSlices.length} imagen(es) cargadas en el visor. Toca "Guardar Offline" para conservarlas.`);
+      }
     } catch (err) {
-      setStatusMessage({ type: 'error', text: err.message || 'Archivo no válido.' });
+      setStatusMessage({ type: 'error', text: err.message || 'No se pudo procesar el archivo seleccionado.' });
     } finally {
       setDownloadProgress(null);
     }
@@ -1026,7 +1127,7 @@ export default function DicomViewerApp() {
           </button>
         </div>
 
-        {/* Botones de Biblioteca Offline y Archivo Local */}
+        {/* Botones de Biblioteca Offline y Archivo Local (sin filtro restrictivo para aceptar cualquier archivo/captura) */}
         <div className="flex items-center gap-1.5">
           <button
             onClick={() => setShowOfflineModal(true)}
@@ -1041,13 +1142,12 @@ export default function DicomViewerApp() {
             className="flex items-center gap-1 px-2.5 py-1.5 text-xs bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-slate-200"
           >
             <Upload className="w-3.5 h-3.5" />
-            <span>Abrir .dcm / .zip</span>
+            <span>Importar Estudio</span>
           </button>
           <input
             ref={fileInputRef}
             type="file"
             multiple
-            accept=".dcm,.zip,application/dicom,application/zip"
             className="hidden"
             onChange={(e) => handleLocalFiles(e.target.files)}
           />
@@ -1067,7 +1167,7 @@ export default function DicomViewerApp() {
         </div>
       )}
 
-      {/* MENSAJE DE ESTADO + BOTÓN DE PESTANA NATIVA SUPERPUESTA */}
+      {/* MENSAJE DE ESTADO + BOTONES DE PORTAL E IMPORTACIÓN */}
       {statusMessage && (
         <div
           className={`px-4 py-2 text-xs flex flex-wrap items-center justify-between gap-2 border-b ${
@@ -1093,8 +1193,8 @@ export default function DicomViewerApp() {
                   onClick={() => fileInputRef.current?.click()}
                   className="flex items-center gap-1 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg shadow"
                 >
-                  <Upload className="w-3.5 h-3.5" />
-                  <span>2. Cargar ZIP/DCM bajado</span>
+                  <Camera className="w-3.5 h-3.5" />
+                  <span>2. Cargar Archivo / Captura</span>
                 </button>
               </>
             )}
@@ -1280,7 +1380,7 @@ export default function DicomViewerApp() {
               {savedStudies.length === 0 ? (
                 <div className="text-center py-8 text-slate-400 text-xs">
                   Aún no tienes estudios guardados en tu dispositivo.<br />
-                  Pega una liga o abre un archivo <b>.zip / .dcm</b> y toca <b>Guardar Offline</b>.
+                  Importa un archivo <b>.dcm / .zip</b> o imágenes y toca <b>Guardar Offline</b>.
                 </div>
               ) : (
                 savedStudies.map((study) => (
